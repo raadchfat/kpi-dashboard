@@ -1,0 +1,422 @@
+import React, { useState, useCallback, useMemo } from 'react';
+import { Upload, FileText, AlertCircle, CheckCircle, TrendingUp, Star, Clock, Wrench, DollarSign, Zap } from 'lucide-react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from 'recharts';
+import * as XLSX from 'xlsx';
+
+const KPIDashboard = () => {
+  const [files, setFiles] = useState({
+    jobs: null,
+    appointments: null,
+    invoices: null
+  });
+  const [uploadedData, setUploadedData] = useState({
+    jobs: null,
+    appointments: null,
+    invoices: null
+  });
+  const [processedData, setProcessedData] = useState(null);
+  const [dataQuality, setDataQuality] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [errors, setErrors] = useState([]);
+  const [selectedOwner, setSelectedOwner] = useState('all');
+
+  const handleFileUpload = useCallback((fileType, file) => {
+    setFiles(prev => ({ ...prev, [fileType]: file }));
+    
+    if (file) {
+      const reader = new FileReader();
+      const fileExtension = file.name.split('.').pop().toLowerCase();
+      
+      reader.onload = (e) => {
+        try {
+          let data = [];
+          
+          if (fileExtension === 'csv') {
+            // CSV parsing
+            const text = e.target.result;
+            const lines = text.split('\n');
+            const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+            
+            data = lines.slice(1).filter(line => line.trim()).map((line, index) => {
+              const values = line.split(',');
+              const row = {};
+              headers.forEach((header, i) => {
+                row[header] = values[i] ? values[i].trim() : '';
+              });
+              row._rowIndex = index + 1;
+              return row;
+            });
+          } else if (fileExtension === 'xlsx' || fileExtension === 'xls') {
+            // Excel parsing using SheetJS
+            const workbook = XLSX.read(e.target.result, { type: 'array' });
+            const firstSheetName = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[firstSheetName];
+            
+            // Convert to JSON with header row as keys
+            const jsonData = XLSX.utils.sheet_to_json(worksheet, { 
+              header: 1,
+              defval: '',
+              blankrows: false
+            });
+            
+            if (jsonData.length > 0) {
+              const headers = jsonData[0].map(h => String(h).trim().toLowerCase());
+              data = jsonData.slice(1).map((row, index) => {
+                const rowObj = {};
+                headers.forEach((header, i) => {
+                  rowObj[header] = row[i] ? String(row[i]).trim() : '';
+                });
+                rowObj._rowIndex = index + 1;
+                return rowObj;
+              }).filter(row => {
+                // Filter out completely empty rows
+                return Object.values(row).some(val => val !== '' && val !== undefined);
+              });
+            }
+          }
+
+          setUploadedData(prev => ({ ...prev, [fileType]: data }));
+          setErrors(prev => prev.filter(error => !error.includes(`${fileType} file`)));
+          
+        } catch (error) {
+          setErrors(prev => [...prev, `Error parsing ${fileType} file: ${error.message}`]);
+        }
+      };
+      
+      // Read file based on type
+      if (fileExtension === 'csv') {
+        reader.readAsText(file);
+      } else {
+        reader.readAsArrayBuffer(file);
+      }
+    }
+  }, []);
+
+  const validateAndProcessData = useCallback(() => {
+    if (!uploadedData.jobs || !uploadedData.appointments || !uploadedData.invoices) {
+      setErrors(['Please upload all three files (Jobs, Appointments, Invoices)']);
+      return;
+    }
+
+    setLoading(true);
+    setErrors([]);
+
+    try {
+      // Common identifier mapping
+      const identifierMap = {
+        'job_id': ['job_id', 'jobid', 'job id', 'id'],
+        'appointment_id': ['appointment_id', 'appointmentid', 'appointment id', 'appt_id'],
+        'technician_id': ['technician_id', 'technicianid', 'technician id', 'tech_id', 'emp_id'],
+        'invoice_id': ['invoice_id', 'invoiceid', 'invoice id', 'inv_id'],
+        'opportunity_owner': ['opportunity_owner', 'owner', 'technician', 'tech_name', 'employee_name']
+      };
+
+      // Function to find matching column name
+      const findColumn = (data, possibleNames) => {
+        const headers = Object.keys(data[0] || {});
+        return possibleNames.find(name => 
+          headers.some(header => header.toLowerCase().includes(name.toLowerCase()))
+        ) || possibleNames.find(name => 
+          headers.includes(name.toLowerCase())
+        );
+      };
+
+      // Normalize data with common identifiers
+      const normalizeData = (data, type) => {
+        return data.map(row => {
+          const normalized = { ...row, _source: type };
+          
+          // Map common identifiers
+          Object.entries(identifierMap).forEach(([standardName, possibleNames]) => {
+            const foundColumn = findColumn(data, possibleNames);
+            if (foundColumn) {
+              normalized[standardName] = row[foundColumn];
+            }
+          });
+
+          return normalized;
+        });
+      };
+
+      const normalizedJobs = normalizeData(uploadedData.jobs, 'jobs');
+      const normalizedAppointments = normalizeData(uploadedData.appointments, 'appointments');
+      const normalizedInvoices = normalizeData(uploadedData.invoices, 'invoices');
+
+      // Create integrated dataset
+      const integratedData = [];
+      const usedRecords = new Set();
+
+      normalizedJobs.forEach(job => {
+        if (!job.opportunity_owner) return;
+
+        const matchingAppointment = normalizedAppointments.find(apt => 
+          apt.job_id === job.job_id || apt.appointment_id === job.appointment_id
+        );
+
+        const matchingInvoice = normalizedInvoices.find(inv => 
+          inv.job_id === job.job_id || inv.invoice_id === job.invoice_id
+        );
+
+        const integrated = {
+          ...job,
+          ...matchingAppointment,
+          ...matchingInvoice,
+          _integrated: true
+        };
+
+        integratedData.push(integrated);
+        if (matchingAppointment) usedRecords.add(`appointment_${matchingAppointment._rowIndex}`);
+        if (matchingInvoice) usedRecords.add(`invoice_${matchingInvoice._rowIndex}`);
+      });
+
+      // Calculate KPIs by opportunity owner
+      const kpiResults = {};
+      
+      integratedData.forEach(record => {
+        const owner = record.opportunity_owner;
+        if (!owner) return;
+
+        if (!kpiResults[owner]) {
+          kpiResults[owner] = {
+            name: owner,
+            totalJobs: 0,
+            hydroJettingSold: 0,
+            descalingSold: 0,
+            onTimeArrivals: 0,
+            totalAppointments: 0,
+            fiveStarReviews: 0,
+            totalReviews: 0,
+            warrantyCallsIssued: 0,
+            totalWarrantyEligible: 0,
+            upsellsConverted: 0,
+            upsellOpportunities: 0
+          };
+        }
+
+        const kpi = kpiResults[owner];
+        kpi.totalJobs++;
+
+        // Hydro Jetting Sold
+        if (record.service_type?.toLowerCase().includes('hydro') || 
+            record.description?.toLowerCase().includes('hydro jetting') ||
+            record.services?.toLowerCase().includes('hydro')) {
+          kpi.hydroJettingSold++;
+        }
+
+        // Descaling Sold
+        if (record.service_type?.toLowerCase().includes('descal') || 
+            record.description?.toLowerCase().includes('descaling') ||
+            record.services?.toLowerCase().includes('descal')) {
+          kpi.descalingSold++;
+        }
+
+        // On-Time Arrival
+        if (record.scheduled_time && record.arrival_time) {
+          kpi.totalAppointments++;
+          const scheduledTime = new Date(record.scheduled_time);
+          const arrivalTime = new Date(record.arrival_time);
+          if (arrivalTime <= scheduledTime) {
+            kpi.onTimeArrivals++;
+          }
+        }
+
+        // 5★ Reviews
+        if (record.review_rating || record.rating) {
+          kpi.totalReviews++;
+          const rating = parseInt(record.review_rating || record.rating);
+          if (rating === 5) {
+            kpi.fiveStarReviews++;
+          }
+        }
+
+        // Warranty Call Rate
+        if (record.warranty_eligible === 'yes' || record.warranty === 'yes') {
+          kpi.totalWarrantyEligible++;
+          if (record.warranty_call === 'yes' || record.callback_required === 'yes') {
+            kpi.warrantyCallsIssued++;
+          }
+        }
+
+        // Upsell Conversion Rate
+        if (record.upsell_opportunity === 'yes' || record.additional_services_offered === 'yes') {
+          kpi.upsellOpportunities++;
+          if (record.upsell_converted === 'yes' || record.additional_services_sold === 'yes') {
+            kpi.upsellsConverted++;
+          }
+        }
+      });
+
+      // Calculate final KPI percentages
+      const finalKPIs = Object.values(kpiResults).map(kpi => ({
+        ...kpi,
+        hydroJettingRate: kpi.totalJobs > 0 ? (kpi.hydroJettingSold / kpi.totalJobs * 100).toFixed(1) : 0,
+        descalingRate: kpi.totalJobs > 0 ? (kpi.descalingSold / kpi.totalJobs * 100).toFixed(1) : 0,
+        onTimeRate: kpi.totalAppointments > 0 ? (kpi.onTimeArrivals / kpi.totalAppointments * 100).toFixed(1) : 0,
+        fiveStarRate: kpi.totalReviews > 0 ? (kpi.fiveStarReviews / kpi.totalReviews * 100).toFixed(1) : 0,
+        warrantyCallRate: kpi.totalWarrantyEligible > 0 ? (kpi.warrantyCallsIssued / kpi.totalWarrantyEligible * 100).toFixed(1) : 0,
+        upsellRate: kpi.upsellOpportunities > 0 ? (kpi.upsellsConverted / kpi.upsellOpportunities * 100).toFixed(1) : 0
+      }));
+
+      // Data Quality Assessment
+      const quality = {
+        totalRecords: integratedData.length,
+        matchedRecords: integratedData.filter(r => r._integrated).length,
+        dataCompleteness: {
+          jobs: (normalizedJobs.length / integratedData.length * 100).toFixed(1),
+          appointments: (normalizedAppointments.length / integratedData.length * 100).toFixed(1),
+          invoices: (normalizedInvoices.length / integratedData.length * 100).toFixed(1)
+        },
+        missingIdentifiers: integratedData.filter(r => !r.job_id && !r.appointment_id).length
+      };
+
+      setProcessedData(finalKPIs);
+      setDataQuality(quality);
+      setLoading(false);
+    } catch (error) {
+      setErrors([`Data processing error: ${error.message}`]);
+      setLoading(false);
+    }
+  }, [uploadedData]);
+
+  const chartData = useMemo(() => {
+    if (!processedData) return null;
+
+    const filteredData = selectedOwner === 'all' ? processedData : processedData.filter(d => d.name === selectedOwner);
+    
+    return {
+      kpiComparison: filteredData.map(d => ({
+        name: d.name,
+        'Hydro Jetting': parseFloat(d.hydroJettingRate),
+        'Descaling': parseFloat(d.descalingRate),
+        'On-Time': parseFloat(d.onTimeRate),
+        '5★ Reviews': parseFloat(d.fiveStarRate),
+        'Warranty Calls': parseFloat(d.warrantyCallRate),
+        'Upsell': parseFloat(d.upsellRate)
+      })),
+      serviceBreakdown: filteredData.map(d => ({
+        name: d.name,
+        'Hydro Jetting': d.hydroJettingSold,
+        'Descaling': d.descalingSold,
+        'Other Services': d.totalJobs - d.hydroJettingSold - d.descalingSold
+      }))
+    };
+  }, [processedData, selectedOwner]);
+
+  const FileUploadSection = ({ type, label, icon: Icon }) => (
+    <div className="bg-white rounded-lg shadow-md p-6 border-2 border-dashed border-gray-300">
+      <div className="flex items-center justify-center mb-4">
+        <Icon className="w-12 h-12 text-blue-500 mr-3" />
+        <h3 className="text-lg font-semibold text-gray-800">{label}</h3>
+      </div>
+      <input
+        type="file"
+        accept=".csv,.xlsx,.xls"
+        onChange={(e) => handleFileUpload(type, e.target.files[0])}
+        className="w-full p-3 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+      />
+      {files[type] && (
+        <div className="mt-2 flex items-center text-green-600">
+          <CheckCircle className="w-4 h-4 mr-2" />
+          <span className="text-sm">{files[type].name} ({files[type].name.split('.').pop().toUpperCase()})</span>
+        </div>
+      )}
+    </div>
+  );
+
+  const KPICard = ({ title, value, icon: Icon, color, unit = '%' }) => (
+    <div className={`bg-white rounded-lg shadow-md p-6 border-l-4 border-${color}-500`}>
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-medium text-gray-500 uppercase tracking-wide">{title}</h3>
+          <p className="text-2xl font-bold text-gray-900 mt-2">{value}{unit}</p>
+        </div>
+        <div className={`p-3 rounded-full bg-${color}-100`}>
+          <Icon className={`w-6 h-6 text-${color}-600`} />
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6">
+      <div className="max-w-7xl mx-auto">
+        <div className="mb-8">
+          <h1 className="text-3xl font-bold text-gray-900 mb-2">Service Business KPI Dashboard</h1>
+          <p className="text-gray-600">Upload your Excel (.xlsx, .xls) or CSV files to analyze opportunity owner performance</p>
+        </div>
+
+        {/* File Upload Section */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+          <FileUploadSection type="jobs" label="Jobs Data" icon={Wrench} />
+          <FileUploadSection type="appointments" label="Appointments Data" icon={Clock} />
+          <FileUploadSection type="invoices" label="Invoices Data" icon={FileText} />
+        </div>
+
+        {/* Process Data Button */}
+        <div className="text-center mb-8">
+          <button
+            onClick={validateAndProcessData}
+            disabled={loading || !files.jobs || !files.appointments || !files.invoices}
+            className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-8 py-3 rounded-lg font-semibold text-lg transition-colors"
+          >
+            {loading ? 'Processing...' : 'Process Data & Generate KPIs'}
+          </button>
+        </div>
+
+        {/* Errors Display */}
+        {errors.length > 0 && (
+          <div className="mb-8 bg-red-50 border border-red-200 rounded-lg p-4">
+            <div className="flex items-center mb-2">
+              <AlertCircle className="w-5 h-5 text-red-500 mr-2" />
+              <h3 className="text-red-800 font-semibold">Data Processing Errors</h3>
+            </div>
+            <ul className="text-red-700 space-y-1">
+              {errors.map((error, index) => (
+                <li key={index} className="text-sm">• {error}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Data Quality Indicator */}
+        {dataQuality && (
+          <div className="mb-8 bg-blue-50 border border-blue-200 rounded-lg p-4">
+            <div className="flex items-center mb-2">
+              <CheckCircle className="w-5 h-5 text-blue-500 mr-2" />
+              <h3 className="text-blue-800 font-semibold">Data Quality Report</h3>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+              <div>
+                <span className="text-blue-600 font-medium">Total Records:</span>
+                <span className="ml-2">{dataQuality.totalRecords}</span>
+              </div>
+              <div>
+                <span className="text-blue-600 font-medium">Matched Records:</span>
+                <span className="ml-2">{dataQuality.matchedRecords}</span>
+              </div>
+              <div>
+                <span className="text-blue-600 font-medium">Data Completeness:</span>
+                <span className="ml-2">{dataQuality.dataCompleteness.jobs}%</span>
+              </div>
+              <div>
+                <span className="text-blue-600 font-medium">Missing IDs:</span>
+                <span className="ml-2">{dataQuality.missingIdentifiers}</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Owner Filter */}
+        {processedData && processedData.length > 0 && (
+          <div className="mb-8">
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Filter by Opportunity Owner:
+            </label>
+            <select
+              value={selectedOwner}
+              onChange={(e) => setSelectedOwner(e.target.value)}
+              className="border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            >
+              <option value="all">All Owners</option>
+              {processedData.map(owner => (
+                <option key={owner.name} value={owner.name}>{
